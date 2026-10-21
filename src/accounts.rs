@@ -130,6 +130,30 @@ pub fn save_accounts(accounts: &[Account], default: &Option<String>) -> Result<(
 /// `account` overrides the configured default. Falls back to the legacy
 /// single-key resolution (static store / env / key files) when no accounts
 /// are configured.
+/// Select which account to use: explicit name, then default, then a lone
+/// account. Pure function over the account table so the policy is testable.
+fn select_account<'a>(
+    account: Option<&str>,
+    default: Option<&str>,
+    accounts: &'a [Account],
+) -> Result<&'a Account> {
+    match account.or(default) {
+        Some(name) => accounts
+            .iter()
+            .find(|a| a.name == name)
+            .ok_or_else(|| anyhow!("account '{}' not found (have: {})", name,
+                accounts.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", "))),
+        // Single account and no default: use it rather than failing.
+        // (Previously this bailed claiming "multiple accounts", which was
+        // both wrong and unusable for the one-account case.)
+        None if accounts.len() == 1 => Ok(&accounts[0]),
+        None => bail!(
+            "multiple accounts configured but no default set; \
+             use `configure account use <name>` or pass --account"
+        ),
+    }
+}
+
 pub fn resolve_api_key(account: Option<&str>) -> Result<String> {
     let (accounts, default) = load_accounts()?;
 
@@ -138,19 +162,7 @@ pub fn resolve_api_key(account: Option<&str>) -> Result<String> {
         return api::get_api_key();
     }
 
-    let name = account.or(default.as_deref());
-
-    let selected = match name {
-        Some(name) => accounts
-            .iter()
-            .find(|a| a.name == name)
-            .ok_or_else(|| anyhow!("account '{}' not found (have: {})", name,
-                accounts.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")))?,
-        None => bail!(
-            "multiple accounts configured but no default set; \
-             use `configure account use <name>` or pass --account"
-        ),
-    };
+    let selected = select_account(account, default.as_deref(), &accounts)?;
 
     let key = selected.effective_key()?;
     // Store in the static cache so legacy call sites pick it up.
@@ -303,5 +315,42 @@ mod tests {
             base_url: None,
         };
         assert!(a.effective_key().is_err());
+    }
+
+    fn acct(name: &str) -> Account {
+        Account { name: name.into(), api_key: Some("k".into()), api_key_file: None, base_url: None }
+    }
+
+    #[test]
+    fn single_account_no_default_is_used() {
+        let accounts = vec![acct("only")];
+        let sel = select_account(None, None, &accounts).unwrap();
+        assert_eq!(sel.name, "only");
+    }
+
+    #[test]
+    fn explicit_name_beats_default_and_lone_account() {
+        let accounts = vec![acct("a"), acct("b")];
+        let sel = select_account(Some("b"), Some("a"), &accounts).unwrap();
+        assert_eq!(sel.name, "b");
+    }
+
+    #[test]
+    fn default_used_when_no_explicit_name() {
+        let accounts = vec![acct("a"), acct("b")];
+        let sel = select_account(None, Some("b"), &accounts).unwrap();
+        assert_eq!(sel.name, "b");
+    }
+
+    #[test]
+    fn multiple_accounts_no_default_errors() {
+        let accounts = vec![acct("a"), acct("b")];
+        assert!(select_account(None, None, &accounts).is_err());
+    }
+
+    #[test]
+    fn unknown_account_name_errors() {
+        let accounts = vec![acct("a")];
+        assert!(select_account(Some("zzz"), None, &accounts).is_err());
     }
 }

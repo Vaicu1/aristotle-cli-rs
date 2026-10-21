@@ -155,6 +155,7 @@ pub fn cmd_dedup(root: Option<PathBuf>, dry_run: bool, execute: bool) -> Result<
     let entries = scan(&root)?;
     info!(root = %root.display(), scanned = entries.len(), "Scan complete");
     println!("Scanned {} project dirs under {}", entries.len(), root.display());
+    let scanned_total = entries.len();
 
     // group by description
     let mut groups: Vec<(String, Vec<ProjectEntry>)> = Vec::new();
@@ -184,7 +185,7 @@ pub fn cmd_dedup(root: Option<PathBuf>, dry_run: bool, execute: bool) -> Result<
 
     let mut report = Report {
         root: root.clone(),
-        scanned: 0,
+        scanned: scanned_total,
         duplicate_groups: groups.len(),
         dirs_kept: 0,
         dirs_archived: 0,
@@ -199,7 +200,6 @@ pub fn cmd_dedup(root: Option<PathBuf>, dry_run: bool, execute: bool) -> Result<
             if e.dir == canonical.dir {
                 continue;
             }
-            report.scanned += 1;
             report.bytes_freed_hint += e.size_bytes;
             archived.push(e.name.clone());
             if dry_run {
@@ -287,5 +287,35 @@ mod tests {
         };
         let group = vec![mk("a", false, "2026-06-16"), mk("b", true, "2026-06-15")];
         assert_eq!(pick_canonical(&group).name, "b");
+    }
+
+    /// Regression: `scanned` in dedup-report.json must be the number of
+    /// project dirs scanned — NOT the number of non-canonical group members
+    /// (the old code counted archived candidates into `scanned`).
+    #[test]
+    fn report_scanned_counts_all_scanned_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |name: &str, desc: &str| {
+            let d = tmp.path().join(name);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(
+                d.join("aristotle_status.json"),
+                format!(r#"{{"description": "{desc}", "created_at": "2026-06-16T00:00:00"}}"#),
+            )
+            .unwrap();
+            d
+        };
+        // 3 scanned dirs: two duplicates + one unique.
+        mk("dup-a", "same");
+        mk("dup-b", "same");
+        mk("uniq", "other");
+
+        cmd_dedup(Some(tmp.path().to_path_buf()), true, false).unwrap();
+
+        let raw = fs::read_to_string(tmp.path().join("dedup-report.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["scanned"], 3, "scanned must equal dirs scanned, not archived candidates");
+        assert_eq!(v["duplicate_groups"], 1);
+        assert_eq!(v["dirs_kept"], 1);
     }
 }
